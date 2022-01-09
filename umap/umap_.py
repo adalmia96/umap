@@ -1583,6 +1583,29 @@ class UMAP(BaseEstimator):
         can also be used when densmap=False to calculate the densities for
         UMAP embeddings.
 
+    mutual_nn_graph: boolean (optional, default False)
+        Specifies whether a mutual k-NN graph rather than the orginal k-NN graph
+        should be used to derive initial topological representation of a dataset
+        and generate the fuzzy_simplicial_set. Turning this setting on can help
+        improve the seperation between similiar classes of datapoints. Parameters
+        below with the prefix 'mnn' further control the behavior of this extension.
+
+    mnn_connectivity: string (optional, default MST-min)
+        Specifies the connectivity method used to connected isolated components
+        in the mutual_nn_graph implementation. There are currently three options:
+                * 'NN': Add an undirected edge between each isolated vertex and its original nearest neighbor.
+                * 'MST-min': Add the minimum number of edges from a maximum spanning tree
+                to the mutual k-NN graph that has been weighted with similarity-based metrics.
+                * 'MST-all': Adding all the edges of the MST.
+
+    mnn_local_neigh: string (optional, default Path)
+        Specifies the local neighbor method used to obtain the new local neighborhood for each point
+        in the mutual_nn_graph. This will be used in the fuzzy_simplicial_set construction.
+        There are currently two options:
+                * 'Adjacent': Only consider neighbors that are directly connected(adjacent).
+                * 'Path': Using shortest path distance to find the new k closest points with
+                respect to the connected mutual k-NN graph.
+
     disconnection_distance: float (optional, default np.inf or maximal value for bounded distances)
         Disconnect any vertices of distance greater than or equal to disconnection_distance when approximating the
         manifold via our k-nn graph. This is particularly useful in the case that you have a bounded metric.  The
@@ -1638,6 +1661,9 @@ class UMAP(BaseEstimator):
         dens_frac=0.3,
         dens_var_shift=0.1,
         output_dens=False,
+        mutual_nn_graph=False,
+        mnn_connectivity = "MST-min",
+        mnn_local_neigh = "Path",
         disconnection_distance=None,
         precomputed_knn=(None, None, None),
     ):
@@ -1680,6 +1706,10 @@ class UMAP(BaseEstimator):
         self.output_dens = output_dens
         self.disconnection_distance = disconnection_distance
         self.precomputed_knn = precomputed_knn
+
+        self.mutual_nn_graph = mutual_nn_graph
+        self.mnn_connectivity = mnn_connectivity
+        self.mnn_local_neigh = mnn_local_neigh
 
         self.n_jobs = n_jobs
 
@@ -1752,6 +1782,19 @@ class UMAP(BaseEstimator):
             self._sparse_data = True
         else:
             self._sparse_data = False
+
+        if self.mutual_nn_graph:
+            if self.isinstance(self.mnn_connectivity, str) and self.mnn_connectivity not in (
+                "NN",
+                "MST-min",
+                "MST-all",
+            ):
+                raise ValueError('string mnn_connectivity values must be "NN", "MST-min", or "MST-all"')
+            if self.isinstance(self.mnn_local_neigh, str) and self.mnn_local_neigh not in (
+                "Path",
+                "Adjacent",
+            ):
+                raise ValueError('string mnn_connectivity values must be "NN", "MST-min", or "MST-all"')
         # set input distance metric & inverse_transform distance metric
         if callable(self.metric):
             in_returns_grad = self._check_custom_metric(
@@ -2525,14 +2568,34 @@ class UMAP(BaseEstimator):
                     n_jobs=self.n_jobs,
                     verbose=self.verbose,
                 )
+
+                if self.mutual_nn_graph:
+                    (
+                        self._mknn_indices,
+                        self._mknn_dists,
+                    ) = mutual_nearest_neighbors(
+                        self._n_neighbors,
+                        self._knn_indices,
+                        self._knn_dists,
+                        self.mnn_connectivity,
+                        self.mnn_local_neigh
+                        verbose=self.verbose,
+                    )
+                    self._nn_indices = self._mknn_indices
+                    self._nn_dists = self._mknn_dists
+                else:
+                    self._nn_indices = self._knn_indices
+                    self._nn_dists = self._knn_dists
+
+
             else:
-                self._knn_indices = self.knn_indices
-                self._knn_dists = self.knn_dists
+                self._nn_indices = self._knn_indices = self.knn_indices
+                self._nn_dists  = self._knn_dists = self.knn_dists
                 self._knn_search_index = self.knn_search_index
             # Disconnect any vertices farther apart than _disconnection_distance
             disconnected_index = self._knn_dists >= self._disconnection_distance
-            self._knn_indices[disconnected_index] = -1
-            self._knn_dists[disconnected_index] = np.inf
+            self._nn_indices[disconnected_index] = -1
+            self._nn_dists[disconnected_index] = np.inf
             edges_removed = disconnected_index.sum()
 
             (
@@ -2546,14 +2609,16 @@ class UMAP(BaseEstimator):
                 random_state,
                 nn_metric,
                 self._metric_kwds,
-                self._knn_indices,
-                self._knn_dists,
+                self._nn_indices,
+                self._nn_dists,
                 self.angular_rp_forest,
                 self.set_op_mix_ratio,
                 self.local_connectivity,
                 True,
                 self.verbose,
                 self.densmap or self.output_dens,
+                self.mutual_nn_graph,
+                self.mnn_local_neigh,
             )
             # Report the number of vertices with degree 0 in our our umap.graph_
             # This ensures that they were properly disconnected.
